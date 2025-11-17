@@ -17,31 +17,40 @@
 #include <sys/stat.h>
 #include <pthread.h>
 
+static Agent *cabeza_agente = NULL;
+
+
+pthread_mutex_t print_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t hora_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t agents_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t hora_cond = PTHREAD_COND_INITIALIZER;
+
 void add_or_update_agent(const char *name, const char *pipeName) {
-    pthread_mutex_lock(&agents_mutex);
-    Agent *p = agents_head;
-    while (p) {
-        if (strcmp(p->name, name) == 0) {
-            strncpy(p->pipeName, pipeName, sizeof(p->pipeName)-1);
-            p->pipeName[sizeof(p->pipeName)-1] = '\0';
-            pthread_mutex_unlock(&agents_mutex);
-            return;
-        }
-        p = p->next;
-    }
-    Agent *a = malloc(sizeof(Agent));
-    if (!a) { perror("malloc"); pthread_mutex_unlock(&agents_mutex); return; }
-    strncpy(a->name, name, sizeof(a->name)-1);
-    a->name[sizeof(a->name)-1] = '\0';
-    strncpy(a->pipeName, pipeName, sizeof(a->pipeName)-1);
-    a->pipeName[sizeof(a->pipeName)-1] = '\0';
-    a->next = agents_head;
-    agents_head = a;
-    pthread_mutex_unlock(&agents_mutex);
+	pthread_mutex_lock(&agents_mutex);
+	char *Agente = cabeza_agente;
+	Agente *p = cabeza_agente;
+	while (p) {
+		if (strcmp(p->name, name) == 0) {
+			strncpy(p->pipeName, pipeName, sizeof(p->pipeName)-1);
+			p->pipeName[sizeof(p->pipeName)-1] = '\0';
+			pthread_mutex_unlock(&agents_mutex);
+			return;
+		}
+	p = p->next;
+	}
+	Agent *a = malloc(sizeof(Agent));
+	if (!a) { perror("malloc"); pthread_mutex_unlock(&agents_mutex); return; }
+	strncpy(a->name, name, sizeof(a->name)-1);
+	a->name[sizeof(a->name)-1] = '\0';
+	strncpy(a->pipeName, pipeName, sizeof(a->pipeName)-1);
+	a->pipeName[sizeof(a->pipeName)-1] = '\0';
+	a->next = agents_head;
+	agents_head = a;
+	pthread_mutex_unlock(&agents_mutex);
 }
 
 int ejecutarParque(int horaI, int horaF, int segundosH, int total, char *pipeR) {
-	int horaActual = horaI;
+	int horaActual = horaI * segundosH;
 	pthread_mutex_t hora_mutex = PTHREAD_MUTEX_INITIALIZER;
 	pthread_mutex_t agents_mutex = PTHREAD_MUTEX_INITIALIZER;
 	pthread_cond_t hora_cond = PTHREAD_COND_INITIALIZER;

@@ -2,14 +2,14 @@ GCC = gcc
 CFLAGS = -lm
 POSIX = -lpthread
 
-PROGRAMAS = cliente servidor
+PROGRAMAS = agente controlador
 
 All: $(PROGRAMAS)
 
-cliente:
+agente:
 	$(GCC) $(CLFAGS) $@.c -o $@
 
-servidor:
+controlador:
 	$(GCC) $(CLFAGS) $@.c -o $@
 
 clean:
