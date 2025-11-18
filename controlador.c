@@ -17,14 +17,17 @@
 #include <pthread.h>
 
 typedef struct {
-	int horaI;                 // hora inicial (1-24)
-	int horaF;                 // hora final (1-24)
-	unsigned int segH;       // segundos que representan una hora de simulación
-	pthread_mutex_t *mutex;      // mutex que protege current_hour y demás estructuras
-	pthread_cond_t  *cond;       // cond variable para notificar al controlador / otros hilos
-	volatile int *hora_actual;  // puntero a la hora de simulación compartida
+	int horaI;
+	int horaF;
+	unsigned int segH;
+	/* mutex que protege current_hour y demás estructuras */
+	pthread_mutex_t *mutex;
+	/* cond variable para notificar al controlador y otros hilos */
+	pthread_cond_t  *cond;
+	/* puntero a la hora de simulación compartida */
+	volatile int *hora_actual;
+	/*bandera para pedir terminación (0 = seguir, 1 = terminar) */
 	volatile int *terminate;
-	/*bandera para pedir terminación (0 = seguir, 1 = terminar)*/
 } RelojArgs;
 
 typedef struct Solicitud {
@@ -37,7 +40,7 @@ typedef struct Solicitud {
 } Solicitud;
 
 typedef struct {
-	char pipe_recibe[256]; /*De aca se reciben los mensajes de los agentes*/
+	char* pipe_recibe;
 
 	// sincronización y datos compartidos con el controlador
 	pthread_mutex_t *mutex_solicitudes;    // protege la cola de solicitudes
@@ -284,11 +287,15 @@ int ejecutarParque(int horaI, int horaF, int segundosH, int total, char *pipeR) 
 	pthread_cond_t cond_solicitudes = PTHREAD_COND_INITIALIZER;
 	int flag_terminar = 0;
 
-	RelojArgs rargs;      // horaI, horaF, segH, mutex, cond, hora_actual, terminate
 	ArgsAgentes args_ag;  // pipe_recibe (pipeR), mutex_solicitudes, cond_solicitudes, cola_cabeza, cola_final, flag_terminar
+	args_ag.pipe_recibe = pipeR;
+	args_ag.mutex_solicitudes = &mutex_solicitudes;
+	args_ag.cond_solicitudes = &cond_solicitudes;
+	args_ag.cola_cabeza = &cola_cabeza;
+	args_ag.cola_final = &cola_final;
+	args_ag.flag_terminar = &flag_terminar;
 
 	crear_hilo_manejador_agentes(&args_ag, &hiloAgentes);
-	crear_hilo_reloj(&rargs, &hiloReloj);
 
 	while (hora_actual < horaF) {
 		pthread_mutex_lock(&mutex_solicitudes);
@@ -302,7 +309,8 @@ int ejecutarParque(int horaI, int horaF, int segundosH, int total, char *pipeR) 
 //	flag_terminar = 1;
 //	terminar = 1;
 //	pthread_cond_broadcast(&cond_solicitudes);
-	pthread_join(hiloAgentes, NULL);
+//	pthread_join(hiloAgentes, NULL);
+	pthread_detach(hiloAgentes);
 
 	/******************************************
 	 * Creación del hilo del reloj
