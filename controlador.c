@@ -4,7 +4,7 @@
 * Fecha: Noviembre 2025
 * Materia: Sistemas Operativos
 * Proyecto: Sistema de Reservas - Cliente
-* Tema: Implementación Agente de Reserva
+* Tema: Implementación Controlador de Reservas
 *****************************************************/
 
 #include <unistd.h>
@@ -28,12 +28,12 @@ typedef struct {
 } RelojArgs;
 
 typedef struct Solicitud {
-    char familia[64];
-    int hora;
-    int personas;
-    char nombre_agente[64];
-    char pipe_respuesta[128];
-    struct Solicitud *siguiente;
+	char familia[64];
+	int hora;
+	int personas;
+	char nombre_agente[64];
+	char pipe_respuesta[128];
+	struct Solicitud *siguiente;
 } Solicitud;
 
 typedef struct {
@@ -218,21 +218,20 @@ static void *hilo_reloj(void *vargs) {
 }
 
 int crear_hilo_manejador_agentes(ArgsAgentes *args, pthread_t *out_hilo) {
-    if (!args || !args->mutex_solicitudes || !args->cond_solicitudes ||
-        !args->cola_cabeza || !args->cola_final || !args->pipe_recibe) {
-        fprintf(stderr, "crear_hilo_manejador_agentes: argumentos inválidos\n");
-        return -1;
-    }
+	if (!args || !args->mutex_solicitudes || !args->cond_solicitudes || !args->cola_cabeza || !args->cola_final || !args->pipe_recibe) {
+		fprintf(stderr, "crear_hilo_manejador_agentes: argumentos inválidos\n");
+		return -1;
+	}
 
-    pthread_t th;
-    int rc = pthread_create(&th, NULL, hilo_manejador_agentes, (void*) args);
-    if (rc != 0) {
-        fprintf(stderr, "crear_hilo_manejador_agentes: pthread_create error %d\n", rc);
-        return -1;
-    }
+	pthread_t th;
+	int rc = pthread_create(&th, NULL, hilo_manejador_agentes, (void*) args);
+	if (rc != 0) {
+		fprintf(stderr, "crear_hilo_manejador_agentes: pthread_create error %d\n", rc);
+		return -1;
+	}
 
-    if (out_hilo) *out_hilo = th;
-    return 0;
+	if (out_hilo) *out_hilo = th;
+	return 0;
 }
 
 int crear_hilo_reloj(RelojArgs *args, pthread_t *salida) {
@@ -257,12 +256,57 @@ int crear_hilo_reloj(RelojArgs *args, pthread_t *salida) {
 
 int ejecutarParque(int horaI, int horaF, int segundosH, int total, char *pipeR) {
 	pthread_mutex_t hora_mutex = PTHREAD_MUTEX_INITIALIZER;
-	pthread_mutex_t agents_mutex = PTHREAD_MUTEX_INITIALIZER;
 	pthread_cond_t hora_cond = PTHREAD_COND_INITIALIZER;
+
+	pthread_mutex_t agentes_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 	int hora_actual = horaI;
 	int terminar = 0;
 	pthread_t hiloReloj;
+	pthread_t hiloAgentes;
+
+	if (mkfifo(pipeR, 0666) < 0) {
+//		if (errno != EEXIST) {
+//			printf("ya existe la pipe %s", pipeR);
+//			return 1;
+//		}
+//	} else {
+		printf("Error al crear el pipe [%s]", pipeR);
+	}
+
+	/******************************************
+	 * Creación del hilo manejador de agentes
+	******************************************/
+
+	Solicitud *cola_cabeza = NULL;
+	Solicitud *cola_final = NULL;
+	pthread_mutex_t mutex_solicitudes = PTHREAD_MUTEX_INITIALIZER;
+	pthread_cond_t cond_solicitudes = PTHREAD_COND_INITIALIZER;
+	int flag_terminar = 0;
+
+	RelojArgs rargs;      // horaI, horaF, segH, mutex, cond, hora_actual, terminate
+	ArgsAgentes args_ag;  // pipe_recibe (pipeR), mutex_solicitudes, cond_solicitudes, cola_cabeza, cola_final, flag_terminar
+
+	crear_hilo_manejador_agentes(&args_ag, &hiloAgentes);
+	crear_hilo_reloj(&rargs, &hiloReloj);
+
+	while (hora_actual < horaF) {
+		pthread_mutex_lock(&mutex_solicitudes);
+		while (cola_cabeza == NULL && hora_actual < horaF)
+			pthread_cond_wait(&cond_solicitudes, &mutex_solicitudes);
+
+		// sacar solicitud si existe y procesarla (imprimir/logic)
+		pthread_mutex_unlock(&mutex_solicitudes);
+	}
+
+//	flag_terminar = 1;
+//	terminar = 1;
+//	pthread_cond_broadcast(&cond_solicitudes);
+	pthread_join(hiloAgentes, NULL);
+
+	/******************************************
+	 * Creación del hilo del reloj
+	******************************************/
 
 	// Configurar argumentos del reloj
 	RelojArgs args;
@@ -299,7 +343,7 @@ int main(int argc, char *argv[]) {
 	int total = 100;
 	char *pipeRecibe = "PIPE_RECEPTOR";
 	char *endptr;
-	//int horaInicioConfig = 0;
+	//int horaInicioConfig = 0; configuración de legado *codigo viejo | recordar eliminar al final :)*
 	size_t _i;
 
 	for (_i = 1; _i < argc; _i++) {
@@ -352,11 +396,13 @@ int main(int argc, char *argv[]) {
 			return 1;
 		}
 	}
+	/* Impresión de los detalles de la simulación */
 	printf("\nInicializando la simulación con las variables ingresadas\n\n");
 	printf("hora inicio: '%d'\n", horaInicio);
 	printf("hora fin: '%d'\n", horaFin);
 	printf("segundos en hora de simulación: '%d'\n", segundosHora);
 	printf("total de personas: '%d'\n", total);
 	printf("Nombre de Pipe Receptora: '%s'\n", pipeRecibe);
+	/* Inicio de función principal */
 	ejecutarParque(horaInicio, horaFin, segundosHora, total, pipeRecibe);
 }
