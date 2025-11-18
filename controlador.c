@@ -1,416 +1,573 @@
-/****************************************************
+/***********************************************************
 * Pontificia Universidad Javeriana
 * Autores: Mateo David Guerra y Ángel Daniel García Santana
 * Fecha: Noviembre 2025
 * Materia: Sistemas Operativos
-* Proyecto: Sistema de Reservas - Cliente
-* Tema: Implementación Controlador de Reservas
-*****************************************************/
+* Proyecto: Sistema de Reservas - Controlador
+* Tema: Uso de Named Pipes, Threads y programación concurrente
+************************************************************/
 
-#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <fcntl.h>
-#include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <pthread.h>
+#include <signal.h>
+#include <errno.h>
 
-typedef struct {
-	int horaI;
-	int horaF;
-	unsigned int segH;
-	/* mutex que protege current_hour y demás estructuras */
-	pthread_mutex_t *mutex;
-	/* cond variable para notificar al controlador y otros hilos */
-	pthread_cond_t  *cond;
-	/* puntero a la hora de simulación compartida */
-	volatile int *hora_actual;
-	/*bandera para pedir terminación (0 = seguir, 1 = terminar) */
-	volatile int *terminate;
-} RelojArgs;
+#define MAX_AGENTES 50
+#define MAX_RESERVAS 1000
+#define MAX_FAMILIA 50
+#define MAX_AGENTE 50
+#define BUFFER_SIZE 512
 
-typedef struct Solicitud {
-	char familia[64];
-	int hora;
-	int personas;
-	char nombre_agente[64];
-	char pipe_respuesta[128];
-	struct Solicitud *siguiente;
-} Solicitud;
+// Estructuras de datos
+typedef struct Agente {
+	char nombre[MAX_AGENTE];
+	char pipe_respuesta[100];
+	struct Agente *siguiente;
+} Agente;
 
-typedef struct {
-	char* pipe_recibe;
+typedef struct Reserva {
+	char familia[MAX_FAMILIA];
+	char agente[MAX_AGENTE];
+	int hora_entrada;
+	int num_personas;
+	// 1: aceptada, 2: reprogramada, 3: rechazada
+	int estado;
+	struct Reserva *siguiente;
+} Reserva;
 
-	// sincronización y datos compartidos con el controlador
-	pthread_mutex_t *mutex_solicitudes;    // protege la cola de solicitudes
-	pthread_cond_t  *cond_solicitudes;     // notifica nuevo elemento en la cola
-	Solicitud **cola_cabeza;               // puntero a la cabeza de la cola (en memoria compartida)
-	Solicitud **cola_final;                // puntero al final de la cola
+typedef struct EstadoHora {
+	int capacidad_actual;
+	int capacidad_maxima;
+	int personas_entrando;
+	int personas_saliendo;
+	Reserva *reservas_activas;
+} EstadoHora;
 
-	// otras variables compartidas
-	int *flag_terminar;                    // si es != 0, acaba el hilo
-} ArgsAgentes;
+typedef struct MensajeAgente {
+	char tipo[20];
+	char nombre_agente[MAX_AGENTE];
+	char pipe_respuesta[100];
+	char familia[MAX_FAMILIA];
+	int hora_solicitada;
+	int num_personas;
+} MensajeAgente;
 
-// ---- Rutina del hilo que atiende al pipe de los agentes ----
-static void *hilo_manejador_agentes(void *vargs) {
-	ArgsAgentes *args = (ArgsAgentes *)vargs;
-	if (!args) return (void*) -1;
+/* Variables globales */
+EstadoHora estado_horas[24];
+Agente *lista_agentes = NULL;
+Reserva *lista_reservas = NULL;
 
-	// Abrir el fifo (named pipe) para lectura. Se asume que el pipe ya fue creado (mkfifo)
-	int fd = open(args->pipe_recibe, O_RDONLY);
-	if (fd < 0) {
-		perror("hilo_manejador_agentes: open pipe_recibe falló");
-		return (void*) -1;
-	}
+pthread_mutex_t mutex_agentes = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t mutex_reservas = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t mutex_horas = PTHREAD_MUTEX_INITIALIZER;
 
-	// Convertir a FILE* para poder usar fgets y procesar línea por línea
-	FILE *fp = fdopen(fd, "r");
-	if (!fp) {
-		perror("hilo_manejador_agentes: fdopen falló");
-		close(fd);
-		return (void*) -1;
-	}
+volatile int running = 1;
+volatile int hora_actual = 7;
+int hora_inicio = 7;
+int hora_fin = 19;
+int segundos_por_hora = 10;
+int capacidad_maxima = 100;
+char pipe_controlador[100] = "/tmp/pipe_controlador";
 
-	char linea[512];
-	while (1) {
-		// Checkar terminación periódicamente
-		if (args->flag_terminar && *args->flag_terminar) {
-			break;
-		}
+/* Estadísticas para reporte final */
+int solicitudes_aceptadas = 0;
+int solicitudes_reprogramadas = 0;
+int solicitudes_rechazadas = 0;
 
-		// Leer una línea (bloqueante hasta que llegue algo)
-		if (fgets(linea, sizeof(linea), fp) == NULL) {
-			// Si fgets devuelve NULL: puede ser EOF (escritores cerraron) o error.
-			if (feof(fp)) {
-				// No hay escritores actualmente: esperar y reintentar (evita salida inmediata)
-				clearerr(fp);
-				sleep(1);
-				continue;
-			} else {
-				perror("hilo_manejador_agentes: fgets error");
-				break;
-			}
-		}
+/* Prototipos de funciones */
+void manejar_senal(int sig);
+void inicializar_sistema();
+void limpiar_sistema();
+void *hilo_receptor_agentes(void *arg);
+void *hilo_reloj_simulacion(void *arg);
+void procesar_mensaje_agente(MensajeAgente *mensaje);
+void registrar_agente(MensajeAgente *mensaje);
+void procesar_solicitud_reserva(MensajeAgente *mensaje);
+int verificar_disponibilidad(int hora_inicio, int num_personas);
+int encontrar_hora_alternativa(int hora_solicitada, int num_personas);
+void responder_agente(const char *pipe_respuesta, const char *mensaje);
+void avanzar_hora_simulacion();
+void generar_reporte_final();
+void agregar_reserva(const char *familia, const char *agente, int hora_entrada, int num_personas, int estado);
 
-		// Limpiar salto de línea
-		size_t L = strlen(linea);
-		if (L > 0 && linea[L-1] == '\n') linea[L-1] = '\0';
-
-		// Parsear mensaje simple CSV: tipo, ...
-		// Tipos esperados: "REG" (registro) o "REQ" (solicitud)
-		char *copia = strdup(linea);
-		if (!copia) continue;
-		char *token = NULL;
-		token = strtok(copia, ",");
-		if (!token) { free(copia); continue; }
-
-		if (strcmp(token, "REG") == 0) {
-			// Mensaje de registro: REG,NOMBRE_AGENTE,PIPE_RESPUESTA
-			char *nombre = strtok(NULL, ",");
-			char *pipe_resp = strtok(NULL, ",");
-
-			if (nombre && pipe_resp) {
-				// Aquí podrías almacenar info del agente en una tabla; por simplicidad imprimimos
-				printf("[ManejadorAgentes] Registro de agente: %s (pipe_resp=%s)\n", nombre, pipe_resp);
-				// (Opcional) responder la hora actual por el pipe de respuesta si se desea.
-			} else {
-				fprintf(stderr, "[ManejadorAgentes] REG mal formado: %s\n", linea);
-			}
-		}
-		else if (strcmp(token, "REQ") == 0) {
-			// REQ,FAMILIA,HORA,PERSONAS
-			char *familia = strtok(NULL, ",");
-			char *hora_s = strtok(NULL, ",");
-			char *personas_s = strtok(NULL, ",");
-			if (!familia || !hora_s || !personas_s) {
-				fprintf(stderr, "[ManejadorAgentes] REQ mal formado: %s\n", linea);
-				free(copia);
-				continue;
-			}
-
-			// Crear estructura solicitud
-			Solicitud *s = malloc(sizeof(Solicitud));
-			if (!s) {
-				perror("[ManejadorAgentes] malloc solicitud");
-				free(copia);
-				continue;
-			}
-			memset(s, 0, sizeof(Solicitud));
-			strncpy(s->familia, familia, sizeof(s->familia)-1);
-			s->hora = atoi(hora_s);
-			s->personas = atoi(personas_s);
-
-			// Opcional: si queremos saber qué agente envió, podríamos exigir que el agente
-			// incluya su nombre o pipe de respuesta en la REQ. Aquí no lo tenemos; rellenar si aplica.
-			strncpy(s->nombre_agente, "desconocido", sizeof(s->nombre_agente)-1);
-			s->pipe_respuesta[0] = '\0';
-			s->siguiente = NULL;
-
-			// Encolar la solicitud protegido por mutex y notificar al controlador
-			pthread_mutex_lock(args->mutex_solicitudes);
-			if (*(args->cola_final) == NULL) {
-				// cola vacía
-				*(args->cola_cabeza) = s;
-				*(args->cola_final) = s;
-			} else {
-				(*(args->cola_final))->siguiente = s;
-				*(args->cola_final) = s;
-			}
-			// Notificar controlador que hay nueva solicitud
-			pthread_cond_signal(args->cond_solicitudes);
-			pthread_mutex_unlock(args->mutex_solicitudes);
-
-			printf("[ManejadorAgentes] Nueva solicitud encolada: familia=%s hora=%d personas=%d\n", s->familia, s->hora, s->personas);
-		}
-		else {
-			fprintf(stderr, "[ManejadorAgentes] Tipo de mensaje desconocido: %s\n", token);
-		}
-
-		free(copia);
-	}
-
-	fclose(fp); // cierra fd también
-	return (void*) 0;
+/* Manejar señal de terminación */
+void manejar_senal(int sig) {
+	printf("\n=====| SEÑAL DE TERMINACIÓN RECIBIDA |=====\n");
+	running = 0;
+	generar_reporte_final();
+	limpiar_sistema();
+	exit(0);
 }
 
-static void *hilo_reloj(void *vargs) {
+/* Inicializar sistema */
+void inicializar_sistema() {
+	printf("\nInicializando el sistema...\n");
 
-	RelojArgs *args = (RelojArgs *)vargs;
-
-	if (args->segH == 0) {
-		printf("segHoras no puede ser 0\n");
-        	return (void *) -1;
+	for (int i = 0; i < 24; i++) {
+		estado_horas[i].capacidad_actual = 0;
+		estado_horas[i].capacidad_maxima = capacidad_maxima;
+		estado_horas[i].personas_entrando = 0;
+		estado_horas[i].personas_saliendo = 0;
+		estado_horas[i].reservas_activas = NULL;
 	}
 
-	/* Inicializar la hora compartida con horaIni si es necesario */
-	pthread_mutex_lock(args->mutex);
-	*args->hora_actual = args->horaI;
-	pthread_cond_broadcast(args->cond); /* notificar hora inicial si se requiere */
-	pthread_mutex_unlock(args->mutex);
+	// Crear pipe del controlador
+	if (mkfifo(pipe_controlador, 0666) == -1 && errno != EEXIST) {
+		perror("Error creando pipe del controlador");
+		exit(1);
+	}
 
-	while (1) {
-		/* Comprobar si nos pidieron terminar antes de dormir */
-		if (args->terminate && *args->terminate) break;
+	printf("Pipe del controlador creado: %s\n", pipe_controlador);
+}
 
-		/* esperar segHoras segundos (representa 1 hora de simulación) */
-		sleep(args->segH);
+// Limpiar sistema (se ejecuta con la finalización del código para no ocupar recursos adicionales)
+void limpiar_sistema() {
+	printf("Limpiando recursos del sistema...\n");
 
-		/* avanzar la hora en la estructura compartida y notificar */
-		pthread_mutex_lock(args->mutex);
-		if (args->terminate && *args->terminate) {
-			printf("[Reloj] el proceso se ha terminado de acuerdo a la solicitud");
-			pthread_mutex_unlock(args->mutex);
+	// Limpiar lista de agentes
+	Agente *agente_actual = lista_agentes;
+	while (agente_actual != NULL) {
+		Agente *temp = agente_actual;
+	agente_actual = agente_actual->siguiente;
+	free(temp);
+	}
+
+	// Limpiar lista de reservas
+	Reserva *reserva_actual = lista_reservas;
+	while (reserva_actual != NULL) {
+		Reserva *temp = reserva_actual;
+		reserva_actual = reserva_actual->siguiente;
+		free(temp);
+	}
+
+	// Eliminar pipe
+	unlink(pipe_controlador);
+}
+
+/* Hilo receptor de agentes */
+void *hilo_receptor_agentes(void *arg) {
+	printf("Hilo receptor de agentes iniciado\n");
+
+	while (running) {
+		int fd = open(pipe_controlador, O_RDONLY);
+		if (fd == -1) {
+			if (running) {
+				perror("Error abriendo pipe del controlador");
+			}
 			break;
 		}
 
-		(*args->hora_actual)++;
-		/* Si la hora llega > 24 opcionalmente normalizar o según reglas del proyecto */
-		/* Imprimir hora (opcional, el controlador puede imprimir también) */
-		printf("[Reloj] Hora simulada: %d\n", *args->hora_actual);
+		MensajeAgente mensaje;
+		ssize_t bytes_leidos = read(fd, &mensaje, sizeof(mensaje));
+		close(fd);
 
-		/* Notificar a los hilos que esperan el avance de hora (e.g. controlador) */
-		pthread_cond_broadcast(args->cond);
-		pthread_mutex_unlock(args->mutex);
+		if (bytes_leidos == sizeof(mensaje)) {
+			procesar_mensaje_agente(&mensaje);
+		} else if (bytes_leidos > 0) {
+			fprintf(stderr, "Error: Mensaje de tamaño incorrecto\n");
+		}
+	}
 
-		/* Si alcanzamos horaFin, terminamos el hilo reloj */
-		if (*args->hora_actual >= args->horaF) break;
+	printf("Hilo receptor de agentes terminado\n");
+	return NULL;
+}
+
+/* Hilo del reloj de simulación */
+void *hilo_reloj_simulacion(void *arg) {
+	printf("Hilo del reloj de simulación iniciado\n");
+	printf("Hora inicial: %d, Hora final: %d, Segundos por hora: %d\n", hora_inicio, hora_fin, segundos_por_hora);
+
+	while (running && hora_actual <= hora_fin) {
+		sleep(segundos_por_hora);
+
+		if (!running) break;
+
+		pthread_mutex_lock(&mutex_horas);
+		avanzar_hora_simulacion();
+		pthread_mutex_unlock(&mutex_horas);
+	}
+
+	printf("Hilo del reloj de simulación terminado\n");
+
+	// Generar reporte final cuando termina la simulación
+	if (hora_actual > hora_fin) {
+		generar_reporte_final();
+		running = 0;
 	}
 
 	return NULL;
 }
 
-int crear_hilo_manejador_agentes(ArgsAgentes *args, pthread_t *out_hilo) {
-	if (!args || !args->mutex_solicitudes || !args->cond_solicitudes || !args->cola_cabeza || !args->cola_final || !args->pipe_recibe) {
-		fprintf(stderr, "crear_hilo_manejador_agentes: argumentos inválidos\n");
-		return -1;
-	}
+// Procesar mensaje del agente
+void procesar_mensaje_agente(MensajeAgente *mensaje) {
+	printf("Mensaje recibido - Tipo: %s, Agente: %s\n", mensaje->tipo, mensaje->nombre_agente);
 
-	pthread_t th;
-	int rc = pthread_create(&th, NULL, hilo_manejador_agentes, (void*) args);
-	if (rc != 0) {
-		fprintf(stderr, "crear_hilo_manejador_agentes: pthread_create error %d\n", rc);
-		return -1;
+	if (strcmp(mensaje->tipo, "REGISTRO") == 0) {
+		registrar_agente(mensaje);
+	} else if (strcmp(mensaje->tipo, "RESERVA") == 0) {
+		procesar_solicitud_reserva(mensaje);
+	} else {
+		fprintf(stderr, "Error: Tipo de mensaje desconocido: %s\n", mensaje->tipo);
 	}
-
-	if (out_hilo) *out_hilo = th;
-	return 0;
 }
 
-int crear_hilo_reloj(RelojArgs *args, pthread_t *salida) {
-	if (args == NULL || args->mutex == NULL || args->cond == NULL || args->hora_actual == NULL) {
-		return -1;
-	}
+// Registrar nuevo agente
+void registrar_agente(MensajeAgente *mensaje) {
+	pthread_mutex_lock(&mutex_agentes);
 
-	if (args->segH == 0) {
-		return -1;
-	}
+	// Agregar agente a la lista
+	Agente *nuevo_agente = malloc(sizeof(Agente));
+	strncpy(nuevo_agente->nombre, mensaje->nombre_agente, sizeof(nuevo_agente->nombre));
+	strncpy(nuevo_agente->pipe_respuesta, mensaje->pipe_respuesta, sizeof(nuevo_agente->pipe_respuesta));
+	nuevo_agente->siguiente = lista_agentes;
+	lista_agentes = nuevo_agente;
 
-	pthread_t reloj;
-	int rc = pthread_create(&reloj, NULL, hilo_reloj, (void *)args);
-	if (rc != 0) {
-		printf("No se pudo crear correctamente el hilo del reloj\n");
-		return rc;
-	}
+	pthread_mutex_unlock(&mutex_agentes);
 
-	if (salida) *salida = reloj;
-	return 0;
+	// Responder con hora actual
+	char respuesta[BUFFER_SIZE];
+	snprintf(respuesta, sizeof(respuesta), "%d", hora_actual);
+	responder_agente(mensaje->pipe_respuesta, respuesta);
+
+	printf("NUEVO AGENTE REGISTRADO: %s (Pipe: %s)\n", mensaje->nombre_agente, mensaje->pipe_respuesta);
 }
 
-int ejecutarParque(int horaI, int horaF, int segundosH, int total, char *pipeR) {
-	pthread_mutex_t hora_mutex = PTHREAD_MUTEX_INITIALIZER;
-	pthread_cond_t hora_cond = PTHREAD_COND_INITIALIZER;
+// Procesar solicitud de reserva
+void procesar_solicitud_reserva(MensajeAgente *mensaje) {
+	printf("SOLICITUD RECIBIDA: Agente %s - Familia %s, Hora %d, Personas %d\n", mensaje->nombre_agente, mensaje->familia, mensaje->hora_solicitada, mensaje->num_personas);
 
-	pthread_mutex_t agentes_mutex = PTHREAD_MUTEX_INITIALIZER;
+	char respuesta[BUFFER_SIZE];
 
-	int hora_actual = horaI;
-	int terminar = 0;
-	pthread_t hiloReloj;
-	pthread_t hiloAgentes;
+	// *VALIDACIÓN 1: Hora fuera del rango de simulación*
+	if (mensaje->hora_solicitada > hora_fin) {
+		snprintf(respuesta, sizeof(respuesta),
+		"RESERVA NEGADA: Familia %s - Hora solicitada (%d) fuera del horario del parque (hora fin: %d)",
+                 mensaje->familia, mensaje->hora_solicitada, hora_fin);
+		solicitudes_rechazadas++;
+	}
+	// *VALIDACIÓN 2: Número de personas excede capacidad máxima*
+	else if (mensaje->num_personas > capacidad_maxima) {
+		snprintf(respuesta, sizeof(respuesta),
+		"RESERVA NEGADA: Familia %s - Número de personas (%d) excede el aforo máximo (%d)",
+		mensaje->familia, mensaje->num_personas, capacidad_maxima);
+		solicitudes_rechazadas++;
+	}
+	// *VALIDACIÓN 3: Hora ya pasó*
+	else if (mensaje->hora_solicitada < hora_actual) {
+		snprintf(respuesta, sizeof(respuesta),
+		"RESERVA NEGADA POR EXTEMPORÁNEA: Familia %s - Hora solicitada (%d) ya pasó (hora actual: %d)",
+		mensaje->familia, mensaje->hora_solicitada, hora_actual);
+		solicitudes_rechazadas++;
 
-	if (mkfifo(pipeR, 0666) < 0) {
-//		if (errno != EEXIST) {
-//			printf("ya existe la pipe %s", pipeR);
-//			return 1;
-//		}
-//	} else {
-		printf("Error al crear el pipe [%s]", pipeR);
+		// Buscar alternativa para reserva extemporánea
+		int hora_alternativa = encontrar_hora_alternativa(mensaje->hora_solicitada, mensaje->num_personas);
+		if (hora_alternativa != -1) {
+			snprintf(respuesta, sizeof(respuesta),
+			"RESERVA REPROGRAMADA: Familia %s - Aceptada para hora %d (solicitó %d) con %d personas",
+			mensaje->familia, hora_alternativa, mensaje->hora_solicitada, mensaje->num_personas);
+			agregar_reserva(mensaje->familia, mensaje->nombre_agente, hora_alternativa, mensaje->num_personas, 2);
+			solicitudes_reprogramadas++;
+		}
+	}
+	// *VERIFICAR DISPONIBILIDAD PARA HORA SOLICITADA*
+	else {
+		int disponible = verificar_disponibilidad(mensaje->hora_solicitada, mensaje->num_personas);
+
+		if (disponible) {
+			// *RESERVA ACEPTADA EN HORA SOLICITADA*
+			snprintf(respuesta, sizeof(respuesta),
+			"RESERVA OK: Familia %s - Aceptada para hora %d con %d personas",
+			mensaje->familia, mensaje->hora_solicitada, mensaje->num_personas);
+
+			agregar_reserva(mensaje->familia, mensaje->nombre_agente, mensaje->hora_solicitada, mensaje->num_personas, 1);
+			solicitudes_aceptadas++;
+		} else {
+			// *BUSCAR HORA ALTERNATIVA*
+			int hora_alternativa = encontrar_hora_alternativa(mensaje->hora_solicitada, mensaje->num_personas);
+
+			if (hora_alternativa != -1) {
+				// *RESERVA REPROGRAMADA*
+				snprintf(respuesta, sizeof(respuesta),
+				"RESERVA REPROGRAMADA: Familia %s - Aceptada para hora %d (solicitó %d) con %d personas",
+				mensaje->familia, hora_alternativa, mensaje->hora_solicitada, mensaje->num_personas);
+
+				agregar_reserva(mensaje->familia, mensaje->nombre_agente, hora_alternativa, mensaje->num_personas, 2);
+				solicitudes_reprogramadas++;
+			} else {
+				// *RESERVA NEGADA SIN ALTERNATIVAS*
+				snprintf(respuesta, sizeof(respuesta), "RESERVA NEGADA: Familia %s - No hay cupo disponible para ningún horario", mensaje->familia);
+				solicitudes_rechazadas++;
+			}
+		}
 	}
 
-	/******************************************
-	 * Creación del hilo manejador de agentes
-	******************************************/
+	// Enviar respuesta al agente
+	responder_agente(mensaje->pipe_respuesta, respuesta);
+	printf("RESPUESTA ENVIADA: %s\n", respuesta);
+}
 
-	Solicitud *cola_cabeza = NULL;
-	Solicitud *cola_final = NULL;
-	pthread_mutex_t mutex_solicitudes = PTHREAD_MUTEX_INITIALIZER;
-	pthread_cond_t cond_solicitudes = PTHREAD_COND_INITIALIZER;
-	int flag_terminar = 0;
+// Verificar disponibilidad para 2 horas consecutivas
+int verificar_disponibilidad(int hora_inicio, int num_personas) {
+	pthread_mutex_lock(&mutex_horas);
 
-	ArgsAgentes args_ag;  // pipe_recibe (pipeR), mutex_solicitudes, cond_solicitudes, cola_cabeza, cola_final, flag_terminar
-	args_ag.pipe_recibe = pipeR;
-	args_ag.mutex_solicitudes = &mutex_solicitudes;
-	args_ag.cond_solicitudes = &cond_solicitudes;
-	args_ag.cola_cabeza = &cola_cabeza;
-	args_ag.cola_final = &cola_final;
-	args_ag.flag_terminar = &flag_terminar;
-
-	crear_hilo_manejador_agentes(&args_ag, &hiloAgentes);
-
-	while (hora_actual < horaF) {
-		pthread_mutex_lock(&mutex_solicitudes);
-		while (cola_cabeza == NULL && hora_actual < horaF)
-			pthread_cond_wait(&cond_solicitudes, &mutex_solicitudes);
-
-		// sacar solicitud si existe y procesarla (imprimir/logic)
-		pthread_mutex_unlock(&mutex_solicitudes);
+	// Verificar que hay cupo para las 2 horas
+	for (int h = hora_inicio; h < hora_inicio + 2 && h <= hora_fin; h++) {
+		if (estado_horas[h].capacidad_actual + num_personas > estado_horas[h].capacidad_maxima) {
+			pthread_mutex_unlock(&mutex_horas);
+			return 0; // No hay cupo
+		}
 	}
 
-//	flag_terminar = 1;
-//	terminar = 1;
-//	pthread_cond_broadcast(&cond_solicitudes);
-//	pthread_join(hiloAgentes, NULL);
-//	pthread_detach(hiloAgentes);
-
-	/******************************************
-	 * Creación del hilo del reloj
-	******************************************/
-
-	// Configurar argumentos del reloj
-	RelojArgs args;
-	args.horaI = horaI;
-	args.horaF = horaF;
-	args.segH = segundosH;
-	args.mutex = &hora_mutex;
-	args.cond = &hora_cond;
-	args.hora_actual = &hora_actual;
-	args.terminate = &terminar;
-
-	/* Creación el hilo reloj */
-	int rc = crear_hilo_reloj(&args, &hiloReloj);
-	if (rc != 0) {
-		printf("Error al crear el hilo reloj\n");
-		return 1;
+	// Reservar el cupo
+	for (int h = hora_inicio; h < hora_inicio + 2 && h <= hora_fin; h++) {
+		estado_horas[h].capacidad_actual += num_personas;
+		if (h == hora_inicio) {
+			estado_horas[h].personas_entrando += num_personas;
+		}
+		if (h == hora_inicio + 1) {
+			estado_horas[h].personas_saliendo += num_personas;
+		}
 	}
 
-	printf("Hilo reloj inicializado en %d\n", horaI);
+	pthread_mutex_unlock(&mutex_horas);
+	return 1; // Cupo disponible
+}
 
-	// Esperar a que el reloj termine (cuando llega a horaFin)
-	pthread_join(hiloReloj, NULL);
+// Encontrar hora alternativa disponible
+int encontrar_hora_alternativa(int hora_solicitada, int num_personas) {
+	pthread_mutex_lock(&mutex_horas);
 
-	printf("Hilo reloj finalizado. Hora final = %d\n", hora_actual);
+	// Buscar cualquier bloque de 2 horas disponible
+	for (int h = hora_actual; h <= hora_fin - 1; h++) {
+		int disponible = 1;
 
-	return 0;
+		// Verificar las 2 horas
+		for (int h2 = h; h2 < h + 2 && h2 <= hora_fin; h2++) {
+			if (estado_horas[h2].capacidad_actual + num_personas > estado_horas[h2].capacidad_maxima) {
+				disponible = 0;
+				break;
+			}
+		}
+
+		if (disponible) {
+			// Reservar el cupo
+			for (int h2 = h; h2 < h + 2 && h2 <= hora_fin; h2++) {
+				estado_horas[h2].capacidad_actual += num_personas;
+				if (h2 == h) {
+				estado_horas[h2].personas_entrando += num_personas;
+				}
+				if (h2 == h + 1) {
+					estado_horas[h2].personas_saliendo += num_personas;
+				}
+			}
+
+			pthread_mutex_unlock(&mutex_horas);
+			return h;
+		}
+	}
+
+	pthread_mutex_unlock(&mutex_horas);
+	return -1; // No hay alternativas
+}
+
+// Responder al agente
+void responder_agente(const char *pipe_respuesta, const char *mensaje) {
+	int fd = open(pipe_respuesta, O_WRONLY);
+	if (fd == -1) {
+		perror("Error abriendo pipe de respuesta del agente");
+		return;
+	}
+
+	write(fd, mensaje, strlen(mensaje) + 1);
+	close(fd);
+}
+
+// Avanzar hora de simulación
+void avanzar_hora_simulacion() {
+	hora_actual++;
+
+	printf("\n=====| HORA ACTUAL: %d |=====\n", hora_actual);
+	printf("\nPersonas entrando: %d\n", estado_horas[hora_actual].personas_entrando);
+	printf("Personas saliendo: %d\n", estado_horas[hora_actual].personas_saliendo);
+	printf("Personas presentes: %d\n", estado_horas[hora_actual].capacidad_actual);
+
+	// Resetear contadores de movimiento para la próxima hora
+	if (hora_actual + 1 < 24) {
+		estado_horas[hora_actual + 1].personas_entrando = 0;
+		estado_horas[hora_actual + 1].personas_saliendo = 0;
+	}
+
+	// Verificar fin de simulación
+	if (hora_actual >= hora_fin) {
+		printf("=====| FINAL DE LA SIMULACIÓN |=====\n");
+	}
+}
+
+/* Agregar reserva a la lista */
+void agregar_reserva(const char *familia, const char *agente, int hora_entrada, int num_personas, int estado) {
+	pthread_mutex_lock(&mutex_reservas);
+
+	Reserva *nueva_reserva = malloc(sizeof(Reserva));
+	strncpy(nueva_reserva->familia, familia, sizeof(nueva_reserva->familia));
+	strncpy(nueva_reserva->agente, agente, sizeof(nueva_reserva->agente));
+	nueva_reserva->hora_entrada = hora_entrada;
+	nueva_reserva->num_personas = num_personas;
+	nueva_reserva->estado = estado;
+	nueva_reserva->siguiente = lista_reservas;
+	lista_reservas = nueva_reserva;
+
+	pthread_mutex_unlock(&mutex_reservas);
+}
+
+/* Generar reporte final */
+void generar_reporte_final() {
+	printf("\n=====| REPORTE FINAL DEL SISTEMA DE RESERVAS |=====\n");
+
+	// Calcular horas pico y horas bajas
+	int max_personas = 0;
+	int min_personas = capacidad_maxima;
+	int horas_pico[24], num_horas_pico = 0;
+	int horas_bajas[24], num_horas_bajas = 0;
+
+	for (int i = hora_inicio; i <= hora_fin; i++) {
+		if (estado_horas[i].capacidad_actual > max_personas) {
+			max_personas = estado_horas[i].capacidad_actual;
+			num_horas_pico = 0;
+			horas_pico[num_horas_pico++] = i;
+		} else if (estado_horas[i].capacidad_actual == max_personas) {
+			horas_pico[num_horas_pico++] = i;
+		}
+
+		if (estado_horas[i].capacidad_actual < min_personas) {
+			min_personas = estado_horas[i].capacidad_actual;
+			num_horas_bajas = 0;
+			horas_bajas[num_horas_bajas++] = i;
+		} else if (estado_horas[i].capacidad_actual == min_personas) {
+			horas_bajas[num_horas_bajas++] = i;
+		}
+	}
+
+	/* Imprimir estadísticas */
+	printf("\n=====| ESTADÍSTICAS DE SOLICITUDES |=====\n\n");
+	printf("Solicitudes aceptadas en hora solicitada: %d\n", solicitudes_aceptadas);
+	printf("Solicitudes reprogramadas: %d\n", solicitudes_reprogramadas);
+	printf("Solicitudes rechazadas: %d\n", solicitudes_rechazadas);
+	printf("Total de solicitudes procesadas: %d\n", solicitudes_aceptadas + solicitudes_reprogramadas + solicitudes_rechazadas);
+
+	printf("\n=====| ANÁLISIS DE OCUPACIÓN |=====\n\n");
+	printf("Horas pico (%d personas): ", max_personas);
+	for (int i = 0; i < num_horas_pico; i++) {
+		printf("%d ", horas_pico[i]);
+	}
+	printf("\n");
+
+	printf("Horas de menor afluencia (%d personas): ", min_personas);
+	for (int i = 0; i < num_horas_bajas; i++) {
+		printf("%d ", horas_bajas[i]);
+	}
+	printf("\n");
+
+	printf("\n=====| RESUMEN POR HORA |=====\n\n");
+	for (int i = hora_inicio; i <= hora_fin; i++) {
+		printf("Hora %d: %d personas (de %d máximo)\n", i, estado_horas[i].capacidad_actual, capacidad_maxima);
+	}
+
+	printf("\n=====| FIN DEL REPORTE |=====\n");
 }
 
 int main(int argc, char *argv[]) {
+	// Configurar manejador de señales
+	signal(SIGINT, manejar_senal);
+	signal(SIGTERM, manejar_senal);
 
-	int horaInicio = 7;
-	int horaFin = 19;
-	int segundosHora = 10;
-	int total = 100;
-	char *pipeRecibe = "PIPE_RECEPTOR";
-	char *endptr;
-	//int horaInicioConfig = 0; configuración de legado *codigo viejo | recordar eliminar al final :)*
-	size_t _i;
+	// Valores por defecto
+	hora_inicio = 7;
+	hora_fin = 19;
+	segundos_por_hora = 10;
+	capacidad_maxima = 100;
+	strcpy(pipe_controlador, "/tmp/pipe_controlador");
 
-	for (_i = 1; _i < argc; _i++) {
-		if (strcmp(argv[_i], "-i") == 0 || strcmp(argv[_i], "--horaInicio") == 0) {
-			_i++;
-			int i = strtol(argv[_i], &endptr, 10);
-                        if (i < 1 || i > 24) {
-				printf("El argumento de hora de inicio \"%s\" no es válido, debe ser un número entero entre 1 y 24 inclusivo\n", argv[_i]);
-				return 1;
-			}
-			horaInicio = i;
-		}
-		else if (strcmp(argv[_i], "-f") == 0 || strcmp(argv[_i], "--horaFin") == 0) {
-			_i++;
-			int f = strtol(argv[_i], &endptr, 10);
-                        if (f <= horaInicio || f > 24) {
-				printf("El argumento de hora de fin \"%s\" no es válido, debe ser un número entero entre la hora de inicio (%d) y 24\n", argv[_i], horaInicio);
-				return 1;
-			}
-			horaFin = f;
-		}
-		else if (strcmp(argv[_i], "-s") == 0 || strcmp(argv[_i], "--segundosHora") == 0) {
-			_i++;
-			int s = strtol(argv[_i], &endptr, 10);
-                        if (s <= 0) {
-				printf("El argumento de segundos en hora \"%s\" no es válido, sebe ser un número entero positivo mayor a 0\n", argv[_i]);
-				return 1;
-			}
-			segundosHora = s;
-		}
-		else if (strcmp(argv[_i], "-t") == 0 || strcmp(argv[_i], "--total") == 0) {
-			_i++;
-			int t = strtol(argv[_i], &endptr, 10);
-                        if (t <= 0) {
-				printf("El argumento de total de personas \"%s\" no es válido, sebe ser un número entero positivo mayor a 0\n", argv[_i]);
-				return 1;
-			}
-			total = t;
-		}
-		else if (strcmp(argv[_i], "-p") == 0 || strcmp(argv[_i], "--pipeRecibe") == 0) {
-			_i++;
-                        if (argv[_i] == NULL) {
-				printf("El argumento de nombre de pipe \"%s\" no es válido\n", argv[_i]);
-				return 1;
-			}
-			pipeRecibe = argv[_i];
-		}
-		else {
-			printf("El argumento \"%s\" no es válido\nUtilice '-h' para ver la lista de comandos", argv[_i]);
+	// Parseo de argumentos
+	int i = 1;
+	while (i < argc) {
+		if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
+			hora_inicio = atoi(argv[i + 1]);
+			i += 2;
+		} else if (strcmp(argv[i], "-f") == 0 && i + 1 < argc) {
+			hora_fin = atoi(argv[i + 1]);
+			i += 2;
+		} else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
+			segundos_por_hora = atoi(argv[i + 1]);
+			i += 2;
+		} else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
+			capacidad_maxima = atoi(argv[i + 1]);
+			i += 2;
+		} else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
+			strncpy(pipe_controlador, argv[i + 1], sizeof(pipe_controlador) - 1);
+			i += 2;
+		} else {
+			fprintf(stderr, "Uso: %s -i hora_inicio -f hora_fin -s segundos_por_hora -t capacidad_maxima -p pipe_controlador\n", argv[0]);
+			fprintf(stderr, "Ejemplo: %s -i 7 -f 19 -s 10 -t 100 -p /tmp/pipe_controlador\n", argv[0]);
 			return 1;
 		}
 	}
-	/* Impresión de los detalles de la simulación */
-	printf("\nInicializando la simulación con las variables ingresadas\n\n");
-	printf("hora inicio: '%d'\n", horaInicio);
-	printf("hora fin: '%d'\n", horaFin);
-	printf("segundos en hora de simulación: '%d'\n", segundosHora);
-	printf("total de personas: '%d'\n", total);
-	printf("Nombre de Pipe Receptora: '%s'\n", pipeRecibe);
-	/* Inicio de función principal */
-	ejecutarParque(horaInicio, horaFin, segundosHora, total, pipeRecibe);
+
+	// Validación de parámetros
+	if (hora_inicio < 1 || hora_inicio > 24 || hora_fin < 1 || hora_fin > 24 || hora_fin <= hora_inicio) {
+		fprintf(stderr, "Error: Horas inválidas. Deben estar entre 1-24 y hora_fin > hora_inicio\n");
+		return 1;
+	}
+
+	if (segundos_por_hora <= 0 || capacidad_maxima <= 0) {
+		fprintf(stderr, "Error: segundos_por_hora y capacidad_maxima deben ser positivos\n");
+		return 1;
+	}
+
+	// Mostrar configuración
+	printf("=====| INICIANDO CONTROLADOR |=====\n");
+	printf("Hora inicio: %d\n", hora_inicio);
+	printf("Hora fin: %d\n", hora_fin);
+	printf("Segundos por hora de simulación: %d\n", segundos_por_hora);
+	printf("Capacidad máxima por hora: %d\n", capacidad_maxima);
+	printf("Pipe del controlador: %s\n", pipe_controlador);
+
+	// Inicializar sistema
+	hora_actual = hora_inicio;
+	inicializar_sistema();
+
+	// Crear hilos
+	pthread_t hilo_receptor, hilo_reloj;
+
+	if (pthread_create(&hilo_receptor, NULL, hilo_receptor_agentes, NULL) != 0) {
+		perror("Error creando hilo receptor de agentes");
+		limpiar_sistema();
+		return 1;
+	}
+
+	if (pthread_create(&hilo_reloj, NULL, hilo_reloj_simulacion, NULL) != 0) {
+		perror("Error creando hilo del reloj");
+		running = 0;
+		pthread_join(hilo_receptor, NULL);
+		limpiar_sistema();
+		return 1;
+	}
+
+	printf("Sistema inicializado correctamente. Esperando agentes...\n");
+
+	// Esperar a que terminen los hilos
+	pthread_join(hilo_reloj, NULL);
+	running = 0;
+	pthread_join(hilo_receptor, NULL);
+
+	// Limpieza final
+	limpiar_sistema();
+	printf("Controlador terminado correctamente.\n");
+
+	return 0;
 }

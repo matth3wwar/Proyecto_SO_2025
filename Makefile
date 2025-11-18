@@ -3,7 +3,6 @@ CFLAGS = -lm
 POSIX = -lpthread
 
 PROGRAMAS = agente controlador
-PIPES = PIPE_RECEPTOR PIPE_RESP_*
 
 All: $(PROGRAMAS)
 
@@ -14,4 +13,4 @@ controlador:
 	$(GCC) $(CLFAGS) $@.c -o $@
 
 clean:
-	$(RM) $(PROGRAMAS) $(PIPES)
+	$(RM) $(PROGRAMAS)
