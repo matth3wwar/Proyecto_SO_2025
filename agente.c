@@ -1,205 +1,235 @@
-/****************************************************
+/**************
 * Pontificia Universidad Javeriana
 * Autores: Mateo David Guerra y Ángel Daniel García Santana
-* Fecha: Noviembre 2025
+* Fecha: 17 Noviembre 2025
 * Materia: Sistemas Operativos
 * Proyecto: Sistema de Reservas - Cliente
-* Tema: Implementación Agente de Reserva
-*****************************************************/
+***************/
 
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <pthread.h>
 #include <fcntl.h>
-#include <errno.h>
-#include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/stat.h>
+#include <signal.h>
 #include <time.h>
 
-#define MAX_LINEA 512
+#define BUFFER_SIZE 256
+#define RESPUESTA_SIZE 512
 
+// Estructura para mensajes al servidor
 typedef struct {
-	char nombre[64];
-	char pipe_receptor[256];
-	char pipe_respuesta[256];
-	int num_solicitudes;
-	int demora_seg;        // demora entre solicitudes
-	int max_personas;
-	int hora_min;
-	int hora_max;
-} ArgsAgente;
+    char nombre_agente[50];
+    char pipe_respuesta[100];
+    char familia[50];
+    int hora_solicitada;
+    int num_personas;
+    char tipo_mensaje[20]; // "REGISTRO" o "RESERVA"
+} MensajeAgente;
 
-/* Hilo lector de la respuesta: abre el pipe_respuesta en O_RDONLY y lee líneas. */
-static void *hilo_lector_respuestas(void *v) {
-	ArgsAgente *args = (ArgsAgente*) v;
-	// Abrir pipe de respuesta (bloqueante hasta que haya quien escriba)
+// Variables globales
+int fd_envio;
+int fd_respuesta;
+char nombre_agente[50];
+char pipe_respuesta[100];
 
-	int fd = open(args->pipe_respuesta, O_RDONLY);
-	if (fd < 0) {
-		printf("[Agente %s] Error abriendo pipe de respuesta '%s'\n", args->nombre, args->pipe_respuesta);
-		return (void*) -1;
-	}
-
-	FILE *fp = fdopen(fd, "r");
-	if (!fp) {
-		printf("[Agente %s] fdopen fallo\n", args->nombre);
-		close(fd);
-		return (void*) -1;
-	}
-
-	char linea[MAX_LINEA];
-	while (fgets(linea, sizeof(linea), fp) != NULL) {
-		// Trim final newline
-		size_t L = strlen(linea);
-		if (L > 0 && linea[L-1] == '\n') linea[L-1] = '\0';
-		printf("[Agente %s] Mensaje recibido en %s: %s\n", args->nombre, args->pipe_respuesta, linea);
-	}
-
-	// Si llegamos aquí es porque el escritor cerró o hubo EOF
-	fclose(fp);
-	return NULL;
+// Función para manejar señales de terminación
+void manejar_senal(int sig) {
+    printf("\nAgente %s terminado por señal.\n", nombre_agente);
+    close(fd_envio);
+    close(fd_respuesta);
+    unlink(pipe_respuesta);
+    exit(0);
 }
 
-/* Función para enviar una línea al pipe receptor (abre, escribe y cierra). */
-static int enviar_linea_pipe_receptor(const char *pipe_receptor, const char *linea) {
-	// Abrir para escritura. Si no hay lector (controlador), open bloqueará hasta que exista uno.
-	int fd = open(pipe_receptor, O_WRONLY);
-	if (fd < 0) {
-		printf("[Agente] Error abriendo pipe receptor '%s'\n", pipe_receptor);
-		return -1;
-	}
+// Función para registrar el agente con el controlador
+int registrar_agente(char* pipe_controlador) {
+    // Crear pipe único para respuestas
+    snprintf(pipe_respuesta, sizeof(pipe_respuesta), "/tmp/agente_%s_%d", nombre_agente, getpid());
+    
+    // Crear el pipe nominal para respuestas
+    if (mkfifo(pipe_respuesta, 0666) == -1) {
+        perror("Error creando pipe de respuesta");
+        return -1;
+    }
 
-	size_t len = strlen(linea);
-	ssize_t w = write(fd, linea, len);
-	if (w != (ssize_t)len) {
-		printf("[Agente] Error al escribir en pipe receptor\n");
-		close(fd);
-		return -1;
-	}
+    // Abrir pipe hacia el controlador (escritura)
+    fd_envio = open(pipe_controlador, O_WRONLY);
+    if (fd_envio == -1) {
+        perror("Error abriendo pipe del controlador");
+        unlink(pipe_respuesta);
+        return -1;
+    }
 
-	// Asegurar newline final (el caller puede ya tenerlo)
-	// close para indicar fin de escritura (el receptor recibirá la línea)
-	close(fd);
-	return 0;
+    // Preparar mensaje de registro
+    MensajeAgente registro;
+    strncpy(registro.nombre_agente, nombre_agente, sizeof(registro.nombre_agente));
+    strncpy(registro.pipe_respuesta, pipe_respuesta, sizeof(registro.pipe_respuesta));
+    strncpy(registro.tipo_mensaje, "REGISTRO", sizeof(registro.tipo_mensaje));
+    
+    // Enviar registro
+    if (write(fd_envio, &registro, sizeof(registro)) == -1) {
+        perror("Error enviando registro al controlador");
+        close(fd_envio);
+        unlink(pipe_respuesta);
+        return -1;
+    }
+
+    printf("Agente %s registrado. Esperando hora actual...\n", nombre_agente);
+    return 0;
 }
 
-/* Genera un entero aleatorio en [a,b] */
-static int rand_range(int a, int b) {
-	if (b < a) return a;
-	return (rand() % (b - a + 1)) + a;
+// Función para recibir la hora actual del controlador
+int recibir_hora_actual() {
+    // Abrir pipe de respuesta (lectura)
+    fd_respuesta = open(pipe_respuesta, O_RDONLY);
+    if (fd_respuesta == -1) {
+        perror("Error abriendo pipe de respuesta");
+        return -1;
+    }
+
+    int hora_actual;
+    if (read(fd_respuesta, &hora_actual, sizeof(hora_actual)) == -1) {
+        perror("Error recibiendo hora actual");
+        close(fd_respuesta);
+        return -1;
+    }
+
+    printf("Hora actual del sistema: %d\n", hora_actual);
+    close(fd_respuesta);
+    return hora_actual;
+}
+
+// Función para procesar archivo de solicitudes
+void procesar_solicitudes(char* archivo_solicitudes, int hora_actual) {
+    FILE* archivo = fopen(archivo_solicitudes, "r");
+    if (!archivo) {
+        perror("Error abriendo archivo de solicitudes");
+        return;
+    }
+
+    char linea[BUFFER_SIZE];
+    char familia[50];
+    int hora_solicitada, num_personas;
+    
+    printf("Iniciando procesamiento de solicitudes...\n");
+
+    while (fgets(linea, sizeof(linea), archivo)) {
+        // Parsear línea CSV
+        if (sscanf(linea, "%[^,],%d,%d", familia, &hora_solicitada, &num_personas) != 3) {
+            printf("Error: Formato inválido en línea: %s", linea);
+            continue;
+        }
+
+        // Validar hora solicitada
+        if (hora_solicitada < hora_actual) {
+            printf("SOLICITUD: Familia %s, Hora %d, Personas %d -> RECHAZADA (hora anterior a actual)\n", 
+                   familia, hora_solicitada, num_personas);
+            sleep(2);
+            continue;
+        }
+
+        // Preparar mensaje de reserva
+        MensajeAgente solicitud;
+        strncpy(solicitud.nombre_agente, nombre_agente, sizeof(solicitud.nombre_agente));
+        strncpy(solicitud.pipe_respuesta, pipe_respuesta, sizeof(solicitud.pipe_respuesta));
+        strncpy(solicitud.familia, familia, sizeof(solicitud.familia));
+        strncpy(solicitud.tipo_mensaje, "RESERVA", sizeof(solicitud.tipo_mensaje));
+        solicitud.hora_solicitada = hora_solicitada;
+        solicitud.num_personas = num_personas;
+
+        // Enviar solicitud
+        if (write(fd_envio, &solicitud, sizeof(solicitud)) == -1) {
+            perror("Error enviando solicitud");
+            break;
+        }
+
+        printf("SOLICITUD ENVIADA: Familia %s, Hora %d, Personas %d\n", 
+               familia, hora_solicitada, num_personas);
+
+        // Esperar respuesta
+        fd_respuesta = open(pipe_respuesta, O_RDONLY);
+        if (fd_respuesta == -1) {
+            perror("Error abriendo pipe para respuesta");
+            break;
+        }
+
+        char respuesta[RESPUESTA_SIZE];
+        int bytes_leidos = read(fd_respuesta, respuesta, sizeof(respuesta)-1);
+        if (bytes_leidos > 0) {
+            respuesta[bytes_leidos] = '\0';
+            printf("RESPUESTA: %s\n", respuesta);
+        } else {
+            printf("Error recibiendo respuesta\n");
+        }
+
+        close(fd_respuesta);
+        sleep(2); // Esperar 2 segundos entre solicitudes
+    }
+
+    fclose(archivo);
 }
 
 int main(int argc, char *argv[]) {
-	ArgsAgente args;
-	memset(&args, 0, sizeof(args));
-	strncpy(args.nombre, "AgenteX", sizeof(args.nombre)-1);
-	strncpy(args.pipe_receptor, "PIPE_RECEPTOR", sizeof(args.pipe_receptor)-1);
-	args.num_solicitudes = 3;
-	args.demora_seg = 2;
-	args.max_personas = 6;
-	args.hora_min = 7;
-	args.hora_max = 19;
+    char* archivo_solicitudes = NULL;
+    char* pipe_controlador = NULL;
+    int opt;
 
-	// Parseo opcional de argumentos
-	for (int i = 1; i < argc; i++) {
-		if (strcmp(argv[i], "-n") == 0 && i+1 < argc) {
-			strncpy(args.nombre, argv[++i], sizeof(args.nombre)-1);
-		} else if (strcmp(argv[i], "-p") == 0 && i+1 < argc) {
-			strncpy(args.pipe_receptor, argv[++i], sizeof(args.pipe_receptor)-1);
-		} else if (strcmp(argv[i], "-r") == 0 && i+1 < argc) {
-			args.num_solicitudes = atoi(argv[++i]);
-		} else if (strcmp(argv[i], "-d") == 0 && i+1 < argc) {
-			args.demora_seg = atoi(argv[++i]);
-		} else if (strcmp(argv[i], "--maxp") == 0 && i+1 < argc) {
-			args.max_personas = atoi(argv[++i]);
-		} else if (strcmp(argv[i], "--hmin") == 0 && i+1 < argc) {
-			args.hora_min = atoi(argv[++i]);
-		} else if (strcmp(argv[i], "--hmax") == 0 && i+1 < argc) {
-			args.hora_max = atoi(argv[++i]);
-		} else {
-			printf("Uso: %s [-n nombre] [-p pipeReceptor] [-r numReq] [-d demoraSeg] [--maxp N] [--hmin H] [--hmax H]\n", argv[0]);
-			return 0;
-		}
-	}
+    // Configurar manejador de señales
+    signal(SIGINT, manejar_senal);
+    signal(SIGTERM, manejar_senal);
 
-	srand((unsigned int)(time(NULL) ^ getpid()));
+    // Parsear argumentos
+    while ((opt = getopt(argc, argv, "s:a:p:")) != -1) {
+        switch (opt) {
+            case 's':
+                strncpy(nombre_agente, optarg, sizeof(nombre_agente)-1);
+                break;
+            case 'a':
+                archivo_solicitudes = optarg;
+                break;
+            case 'p':
+                pipe_controlador = optarg;
+                break;
+            default:
+                fprintf(stderr, "Uso: %s -s nombre_agente -a archivo_solicitudes -p pipe_controlador\n", argv[0]);
+                exit(EXIT_FAILURE);
+        }
+    }
 
-	// Crear pipe de respuesta propio
-	pid_t pid = getpid();
-	snprintf(args.pipe_respuesta, sizeof(args.pipe_respuesta), "PIPE_RESP_%d", (int)pid);
+    // Validar parámetros requeridos
+    if (!nombre_agente[0] || !archivo_solicitudes || !pipe_controlador) {
+        fprintf(stderr, "Error: Faltan parámetros requeridos\n");
+        fprintf(stderr, "Uso: %s -s nombre_agente -a archivo_solicitudes -p pipe_controlador\n", argv[0]);
+        exit(EXIT_FAILURE);
+    }
 
-	// Si ya existe, intentar borrarlo y recrear
-	unlink(args.pipe_respuesta);
-	if (mkfifo(args.pipe_respuesta, 0666) < 0) {
-		if (errno != EEXIST) {
-			printf("[Agente %s] No se pudo crear pipe de respuesta '%s'\n", args.nombre, args.pipe_respuesta);
-			return 1;
-		}
-	}
+    printf("Iniciando Agente de Reserva: %s\n", nombre_agente);
+    printf("Archivo de solicitudes: %s\n", archivo_solicitudes);
+    printf("Pipe del controlador: %s\n", pipe_controlador);
 
-	printf("[Agente %s] Pipe de respuesta creado: %s\n", args.nombre, args.pipe_respuesta);
+    // Registrar agente con el controlador
+    if (registrar_agente(pipe_controlador) == -1) {
+        exit(EXIT_FAILURE);
+    }
 
-	// Arrancar hilo lector de respuestas
-	pthread_t hilo_lector;
-	if (pthread_create(&hilo_lector, NULL, hilo_lector_respuestas, &args) != 0) {
-		printf("[Agente %s] Error creando hilo lector\n", args.nombre);
-		unlink(args.pipe_respuesta);
-		return 1;
-	}
+    // Recibir hora actual del sistema
+    int hora_actual = recibir_hora_actual();
+    if (hora_actual == -1) {
+        close(fd_envio);
+        unlink(pipe_respuesta);
+        exit(EXIT_FAILURE);
+    }
 
-	// Preparar mensaje de registro: "REG,NOMBRE,PIPE_RESPUESTA\n"
-	char linea[MAX_LINEA];
-	snprintf(linea, sizeof(linea), "REG,%s,%s\n", args.nombre, args.pipe_respuesta);
+    // Procesar archivo de solicitudes
+    procesar_solicitudes(archivo_solicitudes, hora_actual);
 
-	printf("[Agente %s] Registrándose en %s ...\n", args.nombre, args.pipe_receptor);
-	if (enviar_linea_pipe_receptor(args.pipe_receptor, linea) != 0) {
-		printf("[Agente %s] Falló el registro (no se pudo escribir en %s)\n", args.nombre, args.pipe_receptor);
-		// intentar limpiar y salir
-		// signal al lector cerrar: para cerrar lector, abrir el pipe_respuesta en O_WRONLY y cerrar
-		int fdtemp = open(args.pipe_respuesta, O_WRONLY | O_NONBLOCK);
-		if (fdtemp >= 0) close(fdtemp);
-		pthread_join(hilo_lector, NULL);
-		unlink(args.pipe_respuesta);
-		return 1;
-	}
-	printf("[Agente %s] Registro enviado.\n", args.nombre);
+    // Limpieza final
+    printf("Agente %s termina.\n", nombre_agente);
+    close(fd_envio);
+    unlink(pipe_respuesta);
 
-	/* Enviar solicitudes */
-	for (int i = 0; i < args.num_solicitudes; i++) {
-		// Generar datos de la solicitud
-		char familia[64];
-		snprintf(familia, sizeof(familia), "Familia_%d_%d", (int)pid, i+1);
-
-		int hora = rand_range(args.hora_min, args.hora_max);
-		int personas = rand_range(1, args.max_personas);
-
-		snprintf(linea, sizeof(linea), "REQ,%s,%d,%d\n", familia, hora, personas);
-		printf("[Agente %s] Enviando solicitud %d/%d: %s", args.nombre, i+1, args.num_solicitudes, linea);
-
-		if (enviar_linea_pipe_receptor(args.pipe_receptor, linea) != 0) {
-			printf("[Agente %s] Error enviando solicitud %d\n", args.nombre, i+1);
-		} else {
-			printf("[Agente %s] Solicitud enviada.\n", args.nombre);
-		}
-
-		sleep(args.demora_seg);
-	}
-
-	/* Esperar un poco para recibir respuestas, luego terminar */
-	printf("[Agente %s] Enviadas todas las solicitudes. Esperando respuestas (5s)...\n", args.nombre);
-	sleep(5);
-
-	// Cerrar hilo lector: para forzar EOF en lector, abrir el pipe_respuesta para escritura y cerrarlo
-	// (esto hará que el fd en lector reciba EOF después de cerrar)
-	int fds = open(args.pipe_respuesta, O_WRONLY | O_NONBLOCK);
-	if (fds >= 0) close(fds);
-
-	pthread_join(hilo_lector, NULL);
-
-	// Borrar pipe de respuesta
-	unlink(args.pipe_respuesta);
-	printf("[Agente %s] Finalizado. Pipe de respuesta eliminado: %s\n", args.nombre, args.pipe_respuesta);
-	return 0;
+    return 0;
 }

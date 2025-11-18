@@ -310,7 +310,7 @@ int ejecutarParque(int horaI, int horaF, int segundosH, int total, char *pipeR) 
 //	terminar = 1;
 //	pthread_cond_broadcast(&cond_solicitudes);
 //	pthread_join(hiloAgentes, NULL);
-	pthread_detach(hiloAgentes);
+//	pthread_detach(hiloAgentes);
 
 	/******************************************
 	 * Creación del hilo del reloj
